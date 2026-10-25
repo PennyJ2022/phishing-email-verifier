@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Email samples may contain personal information
+*.eml
+*.msg
