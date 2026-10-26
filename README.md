@@ -21,20 +21,8 @@ A local-first tool for assessing recruiter emails by collecting and presenting e
 
 ## Usage
 
-- Offline analysis (default):
-  python verify_recruiter.py message.eml
-
-- Offline with a saved company-page text file:
-  python verify_recruiter.py message.eml --page-file careers.txt
-
-- Optional network lookups and company page fetch (safe, user-approved URLs only):
-  python verify_recruiter.py message.eml --network --company-url https://example.com
-
-- Optional non-AI search using approved company/role terms:
-  python verify_recruiter.py message.eml --search
-
-- Optional AI extraction (must be explicitly confirmed before sending any data):
-  python verify_recruiter.py message.eml --ai ollama --model llama3.1 --page-file careers.txt
+See the [Usage Guide](docs/usage.md) for every command-line option and examples covering offline analysis, page
+cross-checking, network lookups, search, AI providers, prompt packets, and saving reports.
 
 ## Privacy and data handling
 
@@ -54,4 +42,5 @@ python -m unittest -q
 
 - [Requirements](docs/REQUIREMENTS.md)
 - [Security policy](docs/SECURITY.md)
+- [Usage guide](docs/usage.md)
 - [Privacy and limitations](docs/privacy-and-limitations.md)
