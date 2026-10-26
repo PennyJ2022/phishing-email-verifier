@@ -52,6 +52,6 @@ python -m unittest -q
 
 ## Project documents
 
-- [Requirements](REQUIREMENTS.md)
-- [Security policy](SECURITY.md)
+- [Requirements](docs/REQUIREMENTS.md)
+- [Security policy](docs/SECURITY.md)
 - [Privacy and limitations](docs/privacy-and-limitations.md)

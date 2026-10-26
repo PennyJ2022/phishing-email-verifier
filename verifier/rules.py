@@ -167,7 +167,8 @@ def crosscheck_heuristic(claims: dict, page: str) -> list:
     out = []
     title = (claims.get("title") or "").strip()
     company = claims.get("company")
-    if company and company.lower() not in page.lower():
+    company_on_page = bool(company and re.search(rf"(?<!\w){re.escape(str(company))}(?!\w)", page, re.I))
+    if company and not company_on_page:
         out.append(Finding("crosscheck", "warn", f"The company name '{company}' does not appear on the page you "
                            "supplied. Is it the right company page?"))
     if not title:
@@ -189,7 +190,7 @@ def crosscheck_heuristic(claims: dict, page: str) -> list:
     if exact:
         out.append(Finding("crosscheck", "pass" if not mismatch else "info",
                            f"The title '{title}' appears on the company page.", exact[0][:120],
-                           key="role_confirmed" if not mismatch else ""))
+                           key="role_confirmed" if not mismatch and company_on_page else ""))
     elif loose:
         out.append(Finding("crosscheck", "warn", f"No exact match for '{title}', but similar lines exist.",
                            "; ".join(l[:60] for l in loose[:3])))

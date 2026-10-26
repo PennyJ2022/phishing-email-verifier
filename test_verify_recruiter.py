@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 import verify_recruiter as vr
+from verifier import network
 
 LEGIT_STYLE = """\
 Authentication-Results: mx.example.net; spf=pass smtp.mailfrom=acme-recruit.example;
@@ -81,9 +82,10 @@ class FakeLLM:
         return "```json\n" + json.dumps({
             "role_found": True,
             "findings": [
-                {"field": "title", "email_claim": "Tech Lead", "page_evidence": "Tech Lead, Platform", "verdict": "match"},
-                {"field": "location", "email_claim": "Remote", "page_evidence": "Fully remote anywhere on Mars",
-                 "verdict": "match"}],
+                {"field": "title", "email_claim": "Tech Lead", "page_value": "Tech Lead",
+                 "page_evidence": "Tech Lead, Platform", "verdict": "match"},
+                {"field": "location", "email_claim": "Remote", "page_value": "Fully remote anywhere on Mars",
+                 "page_evidence": "Fully remote anywhere on Mars", "verdict": "match"}],
             "notes": "ok"}) + "\n```"
 
 
@@ -183,6 +185,25 @@ class TestPrivacy(Base):
             with self.assertRaises(vr.NetError):
                 vr._validate_public_url("https://internal.example/")
 
+    def test_connection_uses_the_public_address_it_validated(self):
+        public_record = (vr.socket.AF_INET, vr.socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        connection = mock.Mock()
+        with mock.patch.object(vr.socket, "getaddrinfo", return_value=[public_record]) as resolve, \
+                mock.patch.object(vr.socket, "socket", return_value=connection):
+            self.assertIs(network._connect_public("example.com", 443, 10), connection)
+        resolve.assert_called_once_with("example.com", 443, type=vr.socket.SOCK_STREAM)
+        connection.connect.assert_called_once_with(("93.184.216.34", 443))
+
+    def test_dns_rebinding_to_private_address_is_rejected_at_connect_time(self):
+        public_record = (vr.socket.AF_INET, vr.socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        private_record = (vr.socket.AF_INET, vr.socket.SOCK_STREAM, 6, "", ("10.0.0.8", 443))
+        with mock.patch.object(vr.socket, "getaddrinfo", side_effect=[[public_record], [private_record]]), \
+                mock.patch.object(vr.socket, "socket") as create_socket:
+            vr._validate_public_url("https://example.com")
+            with self.assertRaises(vr.NetError):
+                network._connect_public("example.com", 443, 10)
+        create_socket.assert_not_called()
+
 
 class TestCrosscheck(Base):
     claims = {"company": "Widgetly", "title": "Tech Lead", "role_type": "individual_contributor", "pay_range": None}
@@ -201,6 +222,7 @@ class TestCrosscheck(Base):
     def test_wrong_company_page_is_warned(self):
         f = vr.crosscheck_heuristic(self.claims, "Other Corp\nTech Lead, Platform")
         self.assertTrue(any("does not appear" in x.message for x in f))
+        self.assertFalse(any(x.key == "role_confirmed" for x in f))
 
     def test_likely_legit_requires_all_signals(self):
         good = [vr.Finding("h", "pass", "a", key="auth_pass"), vr.Finding("d", "pass", "b", key="domain_age_ok"),
@@ -211,6 +233,14 @@ class TestCrosscheck(Base):
 
 
 class TestAI(Base):
+    @mock.patch.dict(os.environ, {"LLM_API_KEY": "test-key"})
+    def test_openai_compatible_provider_sends_bearer_key(self):
+        llm = vr.LLM("openai", model="test-model")
+        response = {"choices": [{"message": {"content": "ok"}}]}
+        with mock.patch.object(llm, "_post", return_value=response) as post:
+            self.assertEqual(llm.complete("system", "user"), "ok")
+        self.assertEqual(post.call_args.args[2]["Authorization"], " ".join(("Bearer", "test-key")))
+
     def test_ai_off_by_default_never_builds_a_model(self):
         original = vr.LLM
         vr.LLM = lambda *a, **k: self.fail("an AI backend was created while ai was off")
@@ -230,11 +260,59 @@ class TestAI(Base):
         ai = [f for f in r.findings if f.area == "crosscheck-ai"]
         self.assertTrue(any(f.key == "role_confirmed" for f in ai))
         # The invented quote must be ignored, not trusted.
-        self.assertTrue(any("not found on the page" in f.message for f in ai))
+        self.assertTrue(any("did not match a claim extracted" in f.message for f in ai))
         # What was sent to the model contains no recipient details or URLs.
         sent = llm.calls[0][1]
         self.assertNotIn("taylor", sent.lower())
         self.assertNotIn("https://", sent)
+
+    def test_ai_title_match_without_company_on_page_cannot_confirm_role(self):
+        class Model:
+            provider = "fake"
+
+            def complete(self, system, user, max_tokens=1500):
+                return json.dumps({"findings": [{
+                    "field": "title", "email_claim": "Tech Lead", "page_value": "Tech Lead",
+                    "page_evidence": "Tech Lead, Platform", "verdict": "match"
+                }]})
+
+        claims = {"company": "Widgetly", "title": "Tech Lead"}
+        findings = vr.ai_crosscheck(Model(), claims, "Tech Lead, Platform")
+        self.assertFalse(any(f.key == "role_confirmed" for f in findings))
+
+    def test_ai_extracted_title_cannot_self_confirm_against_page(self):
+        class Model:
+            provider = "fake"
+
+            def complete(self, system, user, max_tokens=1500):
+                if system == vr.EXTRACT_SYSTEM:
+                    return json.dumps({"company": "Widgetly", "title": "Wizard"})
+                return json.dumps({"findings": [{
+                    "field": "title", "email_claim": "Wizard", "page_value": "Wizard",
+                    "page_evidence": "Widgetly Wizard", "verdict": "match"
+                }]})
+
+        page_path = self._write("page.txt", "Widgetly\nWizard")
+        report = vr.verify_recruiter_email(
+            self.legit, llm=Model(), page_file=page_path,
+            confirm_send=lambda provider, data_kind, size: True,
+        )
+        self.assertEqual(report.claims["title"], "Wizard")
+        self.assertFalse(any(f.key == "role_confirmed" for f in report.findings))
+
+    def test_ai_does_not_accept_page_value_outside_quoted_evidence(self):
+        class Model:
+            provider = "fake"
+
+            def complete(self, system, user, max_tokens=1500):
+                return json.dumps({"findings": [{
+                    "field": "title", "email_claim": "Tech Lead", "page_value": "Tech Lead",
+                    "page_evidence": "Wizard Tech Lead", "verdict": "match"
+                }]})
+
+        claims = {"company": "Widgetly", "title": "Tech Lead"}
+        findings = vr.ai_crosscheck(Model(), claims, "Widgetly\nTech Lead, Platform")
+        self.assertFalse(any(f.key == "role_confirmed" for f in findings))
 
     def test_ai_requires_explicit_confirmation_callback(self):
         llm = FakeLLM()
@@ -285,6 +363,17 @@ class TestSearch(unittest.TestCase):
         self.assertEqual(approved[0][0], "DuckDuckGo")
         self.assertEqual(approved[0][2], len(approved[0][1]))
         self.assertTrue(all("Widgetly" in query or "Tech Lead" in query for query in calls))
+
+    def test_search_ranks_company_named_hosts_first(self):
+        results = vr.search_company_role(
+            {"company": "Widgetly", "title": "Tech Lead"},
+            search_fn=lambda query: [
+                {"title": "Recruiter listing", "url": "https://jobs.example.net/role"},
+                {"title": "Widgetly Careers", "url": "https://careers.widgetly.com/jobs"},
+            ],
+            confirm=lambda *args: True,
+        )
+        self.assertEqual(results[0]["url"], "https://careers.widgetly.com/jobs")
 
     def test_search_does_not_run_without_approval(self):
         calls = []

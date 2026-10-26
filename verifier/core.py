@@ -1,4 +1,6 @@
 import os
+import re
+import urllib.parse
 
 from .ai import LLM, LLMError, ai_crosscheck, ai_extract_claims
 from .models import Finding, Report
@@ -41,15 +43,24 @@ def search_company_role(claims: dict, *, search_fn=None, max_results: int = 5, c
     seen = set()
     for query in queries:
         for item in search_fn(query):
-            if len(results) >= max_results:
-                return results
             key = (item.get("title") or "", item.get("url") or "")
             if key in seen:
                 continue
             seen.add(key)
             if item.get("url"):
                 results.append(item)
-    return results
+    company_tokens = [word.lower() for word in re.findall(r"[a-z0-9]+", str(claims.get("company") or ""))
+                      if len(word) > 2]
+
+    def likely_company_host(item):
+        try:
+            host = (urllib.parse.urlsplit(item["url"]).hostname or "").lower()
+        except ValueError:
+            return False
+        return any(token in host for token in company_tokens)
+
+    results.sort(key=lambda item: not likely_company_host(item))
+    return results[:max_results]
 
 
 def verify_recruiter_email(eml_path: str, *, ai: str = "off", model: str = None,
@@ -69,6 +80,7 @@ def verify_recruiter_email(eml_path: str, *, ai: str = "off", model: str = None,
         findings.append(Finding("domain", "info", "Network lookups were skipped (--no-network)."))
 
     claims, sources = extract_claims(p)
+    rule_claims = dict(claims)
     ai_used = "off"
     if ai != "off" or llm is not None:
         try:
@@ -115,18 +127,20 @@ def verify_recruiter_email(eml_path: str, *, ai: str = "off", model: str = None,
                                     "Search was skipped because explicit approval of the search terms was not provided."))
         elif search_hits:
             findings.append(Finding("search", "info",
-                                   f"Non-AI search found {len(search_hits)} candidate results for the company/role.",
-                                   "; ".join(f"{item.get('title')}: {item.get('url')}" for item in search_hits[:3] if item.get('url')),
-                                   key="search_found"))
+                                   f"Non-AI search returned {len(search_hits)} unverified candidate results; results "
+                                   "are not proof that the source is official or that the role exists.",
+                                   "; ".join(f'"{item.get("title", "")}" - {item.get("url")}'
+                                             for item in search_hits[:3] if item.get("url"))))
         else:
             findings.append(Finding("search", "info", "No non-AI search results were returned using the approved company/role terms."))
     elif search_results:
         search_hits = list(search_results)
         if search_hits:
             findings.append(Finding("search", "info",
-                                   f"Search results provided: {len(search_hits)} candidate listing(s).",
-                                   "; ".join(f"{item.get('title')}: {item.get('url')}" for item in search_hits[:3] if item.get('url')),
-                                   key="search_found"))
+                                   f"Search results provided: {len(search_hits)} unverified candidate result(s); "
+                                   "they are not proof that the source is official or that the role exists.",
+                                   "; ".join(f'"{item.get("title", "")}" - {item.get("url")}'
+                                             for item in search_hits[:3] if item.get("url"))))
 
     if page.strip():
         done = False
@@ -134,14 +148,14 @@ def verify_recruiter_email(eml_path: str, *, ai: str = "off", model: str = None,
             try:
                 page_text = page[:12000]
                 if confirm_send is not None and confirm_send(llm.provider, "company page text", len(page_text)):
-                    findings += ai_crosscheck(llm, claims, page_text)
+                    findings += ai_crosscheck(llm, rule_claims, page_text)
                     done = True
                 else:
                     findings.append(Finding("ai", "info", "AI page comparison cancelled; using rule-based checks."))
             except LLMError as e:
                 findings.append(Finding("ai", "info", f"AI cross-check failed, using rules instead: {e}"))
         if not done:
-            findings += crosscheck_heuristic(claims, page)
+            findings += crosscheck_heuristic(rule_claims, page)
     else:
         findings.append(Finding("crosscheck", "info", "Role not cross-checked. Pass --company-url or --page-file, or use --packet to get a prompt for a chat AI."))
 

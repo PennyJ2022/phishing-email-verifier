@@ -1,3 +1,4 @@
+import http.client
 import ipaddress
 import json
 import re
@@ -13,6 +14,33 @@ from .models import Finding
 
 class NetError(Exception):
     pass
+
+
+def _public_sockaddrs(host: str, port: int):
+    try:
+        records = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise NetError(f"Could not resolve {host}: {e}") from None
+    if not records or any(not ipaddress.ip_address(record[4][0]).is_global for record in records):
+        raise NetError("The URL must resolve only to public IP addresses.")
+    return records
+
+
+def _connect_public(host: str, port: int, timeout, source_address=None):
+    records = _public_sockaddrs(host, port)
+    errors = []
+    for family, socktype, proto, _, sockaddr in records:
+        sock = socket.socket(family, socktype, proto)
+        try:
+            if source_address:
+                sock.bind(source_address)
+            sock.settimeout(timeout)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as e:
+            errors.append(e)
+            sock.close()
+    raise OSError(f"Could not connect to {host}: {errors[-1]}")
 
 
 def _validate_public_url(url: str) -> None:
@@ -31,16 +59,33 @@ def _validate_public_url(url: str) -> None:
     host = parts.hostname.rstrip(".").lower()
     if host == "localhost" or host.endswith((".localhost", ".local")):
         raise NetError("Local network destinations are not allowed.")
-    try:
-        addresses = {ipaddress.ip_address(host)}
-    except ValueError:
-        try:
-            records = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        except socket.gaierror as e:
-            raise NetError(f"Could not resolve {host}: {e}") from None
-        addresses = {ipaddress.ip_address(record[4][0]) for record in records}
-    if not addresses or any(not address.is_global for address in addresses):
-        raise NetError("The URL must resolve only to public IP addresses.")
+    _public_sockaddrs(host, port)
+
+
+class _PublicHTTPConnection(http.client.HTTPConnection):
+    def connect(self):
+        self.sock = _connect_public(self.host, self.port, self.timeout, self.source_address)
+        if self._tunnel_host:
+            self._tunnel()
+
+
+class _PublicHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self):
+        self.sock = _connect_public(self.host, self.port, self.timeout, self.source_address)
+        if self._tunnel_host:
+            self._tunnel()
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self._tunnel_host or self.host)
+
+
+class _PublicHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_PublicHTTPConnection, req)
+
+
+class _PublicHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_PublicHTTPSConnection, req, context=self._context,
+                            check_hostname=self._check_hostname)
 
 
 class _PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -55,7 +100,9 @@ def _get(url: str, accept: str = "*/*", timeout: int = 15, max_bytes: int = 600_
         _validate_public_url(url)
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": accept})
     try:
-        opener = urllib.request.build_opener(_PublicRedirectHandler()) if safe_public else urllib.request
+        opener = (urllib.request.build_opener(urllib.request.ProxyHandler({}), _PublicHTTPHandler(),
+                                              _PublicHTTPSHandler(), _PublicRedirectHandler())
+                  if safe_public else urllib.request)
         with opener.urlopen(req, timeout=timeout) as r:
             return r.read(max_bytes).decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
